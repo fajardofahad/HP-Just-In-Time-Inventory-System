@@ -1,0 +1,223 @@
+<?php
+
+/**
+ * @file
+ * Provides independent permissions for managing fields attached to each type of entity.
+ */
+
+/**
+ * Implements hook_permission().
+ */
+function field_ui_permissions_permission() {
+  $permissions = array();
+
+  // Sort the entity info by label, so the permissions will display in a
+  // sensible order.
+  $entity_info = entity_get_info();
+  uasort($entity_info, 'field_ui_permissions_sort_label');
+
+  // Find each fieldable entity type that defines an administrative UI, and add
+  // custom permissions to access that UI.
+  foreach ($entity_info as $entity_type => $info) {
+    if ($info['fieldable'] && !empty($info['bundles'])) {
+      // Collect information for each bundle that supports configuring fields
+      // via the UI. In particular, we need to know whether the bundle requires
+      // its permissions to be defined as a security risk.
+      $admin_bundle_info = array();
+      foreach ($info['bundles'] as $bundle => $bundle_info) {
+        if (!empty($bundle_info['admin'])) {
+          // To avoid infinite recursion, just assume 'restrict access' is TRUE
+          // when necessary. Otherwise, actually calculate it (when this hook
+          // is being invoked "for real"). Yes, this is ugly.
+          $admin_bundle_info[$bundle]['restrict access'] = _field_ui_permissions_suppress_restrict_access_check() || field_ui_permissions_restrict_access($bundle_info['admin']);
+        }
+      }
+
+      // As long as at least one bundle supports configuring fields via the UI,
+      // define a permission to access that UI. Restrict access to this
+      // permission if any of the bundles have restricted access.
+      if (!empty($admin_bundle_info)) {
+        $permission_name = field_ui_permissions_permission_name($entity_type);
+        $permissions[$permission_name] = array(
+          'title' => t('Administer %type fields', array('%type' => $info['label'])),
+        );
+        $restrict_access = FALSE;
+        foreach ($admin_bundle_info as $bundle_info) {
+          if ($bundle_info['restrict access']) {
+            $restrict_access = TRUE;
+            break;
+          }
+        }
+        $permissions[$permission_name]['restrict access'] = $restrict_access;
+      }
+    }
+  }
+
+  return $permissions;
+}
+
+/**
+ * Implements hook_entity_info_alter().
+ */
+function field_ui_permissions_entity_info_alter(&$entity_info) {
+  // Find each type of entity that defines an administrative UI and modify its
+  // access check to use our custom permissions.
+  foreach ($entity_info as $entity_type => &$info) {
+    if ($info['fieldable'] && !empty($info['bundles'])) {
+      foreach ($info['bundles'] as $bundle => &$bundle_info) {
+        if (!empty($bundle_info['admin'])) {
+          // Before adding our new access restrictions, save the original ones
+          // so we can access them elsewhere.
+          if (isset($bundle_info['admin']['access callback'])) {
+            $bundle_info['admin']['original access callback'] = $bundle_info['admin']['access callback'];
+          }
+          if (isset($bundle_info['admin']['access arguments'])) {
+            $bundle_info['admin']['original access arguments'] = $bundle_info['admin']['access arguments'];
+          }
+          // Use the same defaults as field_ui_menu().
+          $bundle_info['admin'] += array(
+            'original access callback' => 'user_access',
+            'original access arguments' => array('administer site configuration'),
+          );
+
+          // Now replace the original access check with our custom one.
+          $bundle_info['admin']['access callback'] = 'user_access';
+          $bundle_info['admin']['access arguments'] = array(field_ui_permissions_permission_name($entity_type));
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ */
+function field_ui_permissions_module_implements_alter(&$implementations, $hook) {
+  // We want our hook_entity_info_alter() implementation to run last so it
+  // picks up modifications made by any other modules to the entity info.
+  if ($hook == 'entity_info_alter') {
+    $group = $implementations['field_ui_permissions'];
+    unset($implementations['field_ui_permissions']);
+    $implementations['field_ui_permissions'] = $group;
+  }
+}
+
+/**
+ * Returns the name of the permission for managing an entity type's fields.
+ *
+ * @param $entity_type
+ *   A string representing the type of the entity (e.g., 'node' or 'user').
+ *
+ * @return
+ *   The machine name of the permission that this module will use to grant
+ *   access to administering the provided entity type's fields.
+ */
+function field_ui_permissions_permission_name($entity_type) {
+  return "administer fields attached to $entity_type entities";
+}
+
+/**
+ * Determines if a bundle's field UI should have restricted access.
+ *
+ * @param $bundle_admin_info
+ *   An array of information about the bundle's field UI, which corresponds to
+ *   the $entity_info['bundles']['admin'] array returned by entity_get_info()
+ *   when called for this bundle's entity type.
+ *
+ * @return
+ *   TRUE if the bundle's field UI should have restricted access (for security
+ *   reasons), or FALSE if not.
+ */
+function field_ui_permissions_restrict_access($bundle_admin_info) {
+  // If the bundle has some kind of custom access callback, we can't figure out
+  // whether access should be restricted, so just assume it should be.
+  if ($bundle_admin_info['original access callback'] != 'user_access') {
+    return TRUE;
+  }
+  // Otherwise, check whether the permission is one for which access should be
+  // restricted.
+  else {
+    $permission = reset($bundle_admin_info['original access arguments']);
+    return field_ui_permissions_is_restricted_access_permission($permission);
+  }
+}
+
+/**
+ * Determines if a permission has 'restrict access' set to TRUE.
+ *
+ * This function queries each module's hook_permission() implementation to
+ * determine if the provided permission has 'restrict access' set to TRUE.
+ *
+ * Due to infinite recursion limitations, this function will not work when
+ * called on permissions defined by the Field UI Permissions module itself.
+ *
+ * @param $permission
+ *   The machine name of the permission to check.
+ *
+ * @return
+ *   TRUE if the permission has 'restrict access' set to TRUE in the
+ *   hook_permission() implementation of the module which defined it.
+ */
+function field_ui_permissions_is_restricted_access_permission($permission) {
+  $permissions = _field_ui_permissions_permission_list();
+  return !empty($permissions[$permission]['restrict access']);
+}
+
+/**
+ * Returns an array of information about all permissions on the site.
+ *
+ * This is designed to be used within our own hook_permission() implementation
+ * in a way that avoids infinite recursion. Thus, it will not return correct
+ * information about permissions defined by the Field UI Permissions module
+ * itself.
+ *
+ * @return
+ *   An array of information corresponding to module_invoke_all('permission'),
+ *   but modified to protect against infinite recursion when called from within
+ *   field_ui_permissions_permission().
+ */
+function _field_ui_permissions_permission_list() {
+  $permissions = &drupal_static(__FUNCTION__);
+  if (!isset($permissions)) {
+    _field_ui_permissions_suppress_restrict_access_check(TRUE);
+    $permissions = module_invoke_all('permission');
+    _field_ui_permissions_suppress_restrict_access_check(FALSE);
+  }
+  return $permissions;
+}
+
+/**
+ * Sets (or checks) whether this module's 'restrict access' check should occur.
+ *
+ * @param $suppress
+ *   Pass TRUE to suppress the restrict access check, or FALSE to un-suppress
+ *   it.
+ *
+ * @return
+ *   TRUE if the restrict access check is currently suppressed, or FALSE if it
+ *   isn't. By default the access check is not suppressed.
+ *
+ * @see field_ui_permissions_permission()
+ */
+function _field_ui_permissions_suppress_restrict_access_check($suppress = NULL) {
+  $suppress_restrict_access_check = &drupal_static(__FUNCTION__, FALSE);
+  if (isset($suppress)) {
+    $suppress_restrict_access_check = $suppress;
+  }
+  return $suppress_restrict_access_check;
+}
+
+/**
+ * Array sorting callback; sorts elements by the 'label' key.
+ *
+ * @see drupal_sort_title()
+ */
+function field_ui_permissions_sort_label($a, $b) {
+  if (!isset($b['label'])) {
+    return -1;
+  }
+  if (!isset($a['label'])) {
+    return 1;
+  }
+  return strcasecmp($a['label'], $b['label']);
+}
